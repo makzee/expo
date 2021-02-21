@@ -238,11 +238,11 @@ public class ExpoCameraView extends CameraView implements LifecycleEventListener
         profile.videoBitRate = ((Double) options.get(VIDEO_BITRATE_KEY)).intValue();
       }
 
-      if (options.hasKey(VIDEO_FRAME_WIDTH)) {
+      if (options.get(VIDEO_FRAME_WIDTH) != null) {
         profile.videoFrameWidth = ((Double) options.get(VIDEO_FRAME_WIDTH)).intValue();
       }
 
-      if (options.hasKey(VIDEO_FRAME_HEIGHT)) {
+      if (options.get(VIDEO_FRAME_HEIGHT) != null) {
         profile.videoFrameHeight = ((Double) options.get(VIDEO_FRAME_HEIGHT)).intValue();
       }
 
