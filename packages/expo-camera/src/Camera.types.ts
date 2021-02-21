@@ -152,6 +152,8 @@ export type CameraRecordingOptions = {
   mirror?: boolean;
   // Android
   videoBitrate?: number;
+  videoFrameWidth?: number;
+  videoFrameHeight?: number;
 };
 
 export type CameraCapturedPicture = {
