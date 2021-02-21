@@ -3,12 +3,16 @@
 #import <EXUpdates/EXUpdatesRemoteAppLoader.h>
 #import <EXUpdates/EXUpdatesCrypto.h>
 #import <EXUpdates/EXUpdatesFileDownloader.h>
+#import <UMCore/UMUtilities.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
 @interface EXUpdatesRemoteAppLoader ()
 
 @property (nonatomic, strong) EXUpdatesFileDownloader *downloader;
+@property (nonatomic, strong) EXUpdatesUpdate *remoteUpdate;
+
+@property (nonatomic, strong) dispatch_queue_t completionQueue;
 
 @end
 static NSString * const EXUpdatesRemoteAppLoaderErrorDomain = @"EXUpdatesRemoteAppLoader";
@@ -22,6 +26,7 @@ static NSString * const EXUpdatesRemoteAppLoaderErrorDomain = @"EXUpdatesRemoteA
 {
   if (self = [super initWithConfig:config database:database directory:directory completionQueue:completionQueue]) {
     _downloader = [[EXUpdatesFileDownloader alloc] initWithUpdatesConfig:self.config];
+    _completionQueue = completionQueue;
   }
   return self;
 }
@@ -32,9 +37,33 @@ static NSString * const EXUpdatesRemoteAppLoaderErrorDomain = @"EXUpdatesRemoteA
                     error:(EXUpdatesAppLoaderErrorBlock)error
 {
   self.manifestBlock = manifestBlock;
-  self.successBlock = success;
   self.errorBlock = error;
+
+  UM_WEAKIFY(self)
+  self.successBlock = ^(EXUpdatesUpdate * _Nullable update) {
+    UM_STRONGIFY(self)
+    // even if update is nil (meaning we didn't load a new update),
+    // we want to persist the header data from _remoteUpdate
+    if (self->_remoteUpdate) {
+      dispatch_async(self.database.databaseQueue, ^{
+        NSError *metadataError;
+        [self.database setMetadataWithManifest:self->_remoteUpdate error:&metadataError];
+        dispatch_async(self->_completionQueue, ^{
+          if (metadataError) {
+            NSLog(@"Error persisting header data to disk: %@", metadataError.localizedDescription);
+            error(metadataError);
+          } else {
+            success(update);
+          }
+        });
+      });
+    } else {
+      success(update);
+    }
+  };
+
   [_downloader downloadManifestFromURL:url withDatabase:self.database successBlock:^(EXUpdatesUpdate *update) {
+    self->_remoteUpdate = update;
     [self startLoadingFromManifest:update];
   } errorBlock:^(NSError *error, NSURLResponse *response) {
     if (self.errorBlock) {

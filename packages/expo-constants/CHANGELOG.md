@@ -11,6 +11,9 @@
 
 ### 🐛 Bug fixes
 
+- Fixed support for Android Gradle plugin 4.1+ ([#11926](https://github.com/expo/expo/pull/11926) by [@esamelson](https://github.com/esamelson))
+- Add deprecation messages for previously deprecated Constants fields. ([#11960](https://github.com/expo/expo/pull/11960) by [@ide](https://github.com/ide))
+
 ## 10.0.1 — 2021-01-25
 
 _This version does not introduce any user-facing changes._

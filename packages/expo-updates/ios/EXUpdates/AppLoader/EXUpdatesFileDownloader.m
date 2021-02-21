@@ -74,16 +74,40 @@ NSTimeInterval const EXUpdatesDefaultTimeoutInterval = 60;
   } errorBlock:errorBlock];
 }
 
+- (NSURLRequest *)createManifestRequestWithURL:(NSURL *)url
+{
+  NSURLRequestCachePolicy cachePolicy = _sessionConfiguration ? _sessionConfiguration.requestCachePolicy : NSURLRequestUseProtocolCachePolicy;
+  if (_config.usesLegacyManifest) {
+    // legacy manifest loads should ignore cache-control headers from the server and always load remotely
+    cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+  }
+
+  NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url cachePolicy:cachePolicy timeoutInterval:EXUpdatesDefaultTimeoutInterval];
+  [self _setManifestHTTPHeaderFields:request];
+
+  return request;
+}
+
 - (void)downloadManifestFromURL:(NSURL *)url
                    withDatabase:(EXUpdatesDatabase *)database
                    successBlock:(EXUpdatesFileDownloaderManifestSuccessBlock)successBlock
                      errorBlock:(EXUpdatesFileDownloaderErrorBlock)errorBlock
 {
-  NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url
-                                                         cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                     timeoutInterval:EXUpdatesDefaultTimeoutInterval];
-  [self _setManifestHTTPHeaderFields:request];
+  NSURLRequest *request = [self createManifestRequestWithURL:url];
   [self _downloadDataWithRequest:request successBlock:^(NSData *data, NSURLResponse *response) {
+    if (![response isKindOfClass:[NSHTTPURLResponse class]]) {
+      errorBlock([NSError errorWithDomain:EXUpdatesFileDownloaderErrorDomain
+                                     code:1040
+                                 userInfo:@{
+                                   NSLocalizedDescriptionKey: @"response must be a NSHTTPURLResponse",
+                                 }
+                  ], response);
+      return;
+    }
+    NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+    NSDictionary *headerDictionary = [httpResponse allHeaderFields];
+    id headerSignature = headerDictionary[@"expo-manifest-signature"];
+    
     NSError *err;
     id parsedJson = [NSJSONSerialization JSONObjectWithData:data options:kNilOptions error:&err];
     if (err) {
@@ -91,43 +115,62 @@ NSTimeInterval const EXUpdatesDefaultTimeoutInterval = 60;
       return;
     }
 
-    NSDictionary *manifest = [self _extractManifest:parsedJson error:&err];
+    NSDictionary *updateResponseDictionary = [self _extractUpdateResponseDictionary:parsedJson error:&err];
     if (err) {
       errorBlock(err, response);
       return;
     }
 
-    id innerManifestString = manifest[@"manifestString"];
-    id signature = manifest[@"signature"];
-    BOOL isSigned = innerManifestString != nil && signature != nil;
+    id bodyManifestString = updateResponseDictionary[@"manifestString"];
+    id bodySignature = updateResponseDictionary[@"signature"];
+    BOOL isSignatureInBody = bodyManifestString != nil && bodySignature != nil;
 
+    id signature = isSignatureInBody ? bodySignature : headerSignature;
+    id manifestString = isSignatureInBody ? bodyManifestString : [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+      
     // XDL serves unsigned manifests with the `signature` key set to "UNSIGNED".
     // We should treat these manifests as unsigned rather than signed with an invalid signature.
-    if (isSigned && [signature isKindOfClass:[NSString class]] && [(NSString *)signature isEqualToString:@"UNSIGNED"]) {
-      isSigned = NO;
+    BOOL isUnsignedFromXDL = [(NSString *)signature isEqualToString:@"UNSIGNED"];
 
-      NSError *err;
-      manifest = [NSJSONSerialization JSONObjectWithData:[(NSString *)innerManifestString dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&err];
-      NSAssert(!err && manifest && [manifest isKindOfClass:[NSDictionary class]], @"manifest should be a valid JSON object");
-      NSMutableDictionary *mutableManifest = [manifest mutableCopy];
-      mutableManifest[@"isVerified"] = @(NO);
-      manifest = [mutableManifest copy];
+    if (![manifestString isKindOfClass:[NSString class]]) {
+      errorBlock([NSError errorWithDomain:EXUpdatesFileDownloaderErrorDomain
+                                     code:1041
+                                 userInfo:@{
+                                   NSLocalizedDescriptionKey: @"manifestString should be a string",
+                                 }
+                  ], response);
+      return;
     }
-
-    if (isSigned) {
-      NSAssert([innerManifestString isKindOfClass:[NSString class]], @"manifestString should be a string");
-      NSAssert([signature isKindOfClass:[NSString class]], @"signature should be a string");
-      [EXUpdatesCrypto verifySignatureWithData:(NSString *)innerManifestString
+    NSDictionary *manifest = [NSJSONSerialization JSONObjectWithData:[(NSString *)manifestString dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&err];
+    if (err || !manifest || ![manifest isKindOfClass:[NSDictionary class]]) {
+      errorBlock([NSError errorWithDomain:EXUpdatesFileDownloaderErrorDomain
+                                     code:1042
+                                 userInfo:@{
+                                   NSLocalizedDescriptionKey: @"manifest should be a valid JSON object",
+                                 }
+                  ], response);
+      return;
+    }
+    NSMutableDictionary *mutableManifest = [manifest mutableCopy];
+      
+    if (signature != nil && !isUnsignedFromXDL) {
+      if (![signature isKindOfClass:[NSString class]]) {
+        errorBlock([NSError errorWithDomain:EXUpdatesFileDownloaderErrorDomain
+                                       code:1043
+                                   userInfo:@{
+                                     NSLocalizedDescriptionKey: @"signature should be a string",
+                                   }
+                    ], response);
+        return;
+      }
+      [EXUpdatesCrypto verifySignatureWithData:(NSString *)manifestString
                                      signature:(NSString *)signature
                                         config:self->_config
                                   successBlock:^(BOOL isValid) {
                                                   if (isValid) {
-                                                    NSError *err;
-                                                    id innerManifest = [NSJSONSerialization JSONObjectWithData:[(NSString *)innerManifestString dataUsingEncoding:NSUTF8StringEncoding] options:kNilOptions error:&err];
-                                                    NSAssert(!err && innerManifest && [innerManifest isKindOfClass:[NSDictionary class]], @"manifest should be a valid JSON object");
-                                                    NSMutableDictionary *mutableInnerManifest = [(NSDictionary *)innerManifest mutableCopy];
-                                                    mutableInnerManifest[@"isVerified"] = @(YES);
-                                                    EXUpdatesUpdate *update = [EXUpdatesUpdate updateWithManifest:[mutableInnerManifest copy]
+                                                    mutableManifest[@"isVerified"] = @(YES);
+                                                    EXUpdatesUpdate *update = [EXUpdatesUpdate updateWithManifest:[mutableManifest copy]
+                                                                                                         response:response
                                                                                                            config:self->_config
                                                                                                          database:database];
                                                     successBlock(update);
@@ -141,7 +184,9 @@ NSTimeInterval const EXUpdatesDefaultTimeoutInterval = 60;
                                                 }
       ];
     } else {
-      EXUpdatesUpdate *update = [EXUpdatesUpdate updateWithManifest:(NSDictionary *)manifest
+      mutableManifest[@"isVerified"] = @(NO);
+      EXUpdatesUpdate *update = [EXUpdatesUpdate updateWithManifest:[(NSDictionary *)mutableManifest copy]
+                                                           response:response
                                                              config:self->_config
                                                            database:database];
       successBlock(update);
@@ -169,7 +214,7 @@ NSTimeInterval const EXUpdatesDefaultTimeoutInterval = 60;
   NSURLSessionDataTask *task = [_session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
     if (!error && [response isKindOfClass:[NSHTTPURLResponse class]]) {
       NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
-      if (httpResponse.statusCode != 200) {
+      if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
         NSStringEncoding encoding = [self _encodingFromResponse:response];
         NSString *body = [[NSString alloc] initWithData:data encoding:encoding];
         error = [self _errorFromResponse:httpResponse body:body];
@@ -185,7 +230,7 @@ NSTimeInterval const EXUpdatesDefaultTimeoutInterval = 60;
   [task resume];
 }
 
-- (nullable NSDictionary *)_extractManifest:(id)parsedJson error:(NSError **)error
+- (nullable NSDictionary *)_extractUpdateResponseDictionary:(id)parsedJson error:(NSError **)error
 {
   if ([parsedJson isKindOfClass:[NSDictionary class]]) {
     return (NSDictionary *)parsedJson;
